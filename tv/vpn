@@ -1,0 +1,88 @@
+#!/bin/sh
+# OpenVPN control for the TV: vpn up [profile]|down|restart [profile]|status|list.
+# Called by the VPN app via HBChannel exec. Profiles are $D/<name>.ovpn; the last one used is in $D/profile.
+D=/media/developer/vpn
+PID=/tmp/openvpn.pid
+LOG=/tmp/openvpn.log
+RESOLV=/var/lib/misc/resolv.conf   # /etc/resolv.conf symlinks here
+
+# check the process name too: a stale pid file (openvpn died outside "down") may point at a reused pid
+running() { [ -f $PID ] && [ "$(cat /proc/$(cat $PID)/comm 2>/dev/null)" = openvpn ]; }
+
+# Point resolv.conf at the server-pushed resolver via a RAM bind mount; bypasses connmand's
+# long-lived upstream sockets, which would keep resolving outside the tunnel.
+dns_on() {
+    grep -q " $RESOLV " /proc/mounts && return
+    dns=$(env | sed -n 's/^foreign_option_[0-9]*=dhcp-option DNS //p' | head -n 1)
+    [ -n "$dns" ] || return
+    echo "nameserver $dns" > /tmp/resolv.vpn
+    mount --bind /tmp/resolv.vpn $RESOLV
+}
+dns_off() { grep -q " $RESOLV " /proc/mounts && umount $RESOLV; }
+
+toast() {
+    luna-send -a local.vpn -n 1 luna://com.webos.notification/createToast \
+        "{\"sourceId\":\"local.vpn\",\"message\":\"$1\"}" </dev/null >/dev/null
+}
+
+case "$1" in
+up)
+    running && exit 0
+    P=${2:-$(cat $D/profile 2>/dev/null)}
+    [ -n "$P" ] || P=$(basename "$(ls $D/*.ovpn | head -n 1)" .ovpn)
+    [ -f "$D/$P.ovpn" ] || { echo "no profile $P" >&2; exit 1; }
+    echo "$P" > $D/profile
+    # close fds inherited from HBChannel's node (its ls-hubd sockets), else they outlive the service
+    for fd in $(ls /proc/$$/fd); do [ $fd -gt 2 ] && eval "exec $fd>&-"; done
+    $D/openvpn --config "$D/$P.ovpn" --auth-user-pass $D/creds \
+        --pull-filter ignore block-outside-dns --daemon --writepid $PID --log-append $LOG \
+        --script-security 2 --route-up "$D/vpn hook-up" --down "$D/vpn hook-down"
+    ;;
+hook-up)
+    dns_on
+    toast "VPN connected ($(cat $D/profile))"
+    ;;
+hook-down)
+    dns_off
+    toast "VPN disconnected"
+    ;;
+down)
+    if running; then
+        kill "$(cat $PID)"
+        n=0; while running && [ $n -lt 3 ]; do sleep 1; n=$((n+1)); done
+        running && kill -9 "$(cat $PID)"
+    fi
+    dns_off   # also covers openvpn having died without running its down hook
+    ;;
+restart)
+    [ -z "$2" ] || [ -f "$D/$2.ovpn" ] || { echo "no profile $2" >&2; exit 1; }
+    "$0" down
+    exec "$0" up "$2"
+    ;;
+list)
+    # all profiles, current one marked with "*"
+    cur=$(cat $D/profile 2>/dev/null)
+    for f in $D/*.ovpn; do
+        [ -f "$f" ] || continue
+        n=$(basename "$f" .ovpn)
+        [ "$n" = "$cur" ] && echo "* $n" || echo "  $n"
+    done
+    ;;
+status)
+    if ! running; then
+        # resolv.conf still points at the tunnel resolver: all DNS fails until "down"
+        grep -q " $RESOLV " /proc/mounts && echo "dns stuck" || echo disconnected
+    else
+        # log is appended across runs and ping-restarts, so check the last event (banner = new run)
+        case "$(grep -E "Initialization Sequence Completed|process restarting| OpenVPN [0-9]" $LOG | tail -n 1)" in
+        *Completed*) echo connected ;;
+        *restarting*) echo reconnecting ;;
+        *) echo connecting ;;
+        esac
+    fi
+    ;;
+*)
+    echo "usage: $0 up [profile]|down|restart [profile]|status|list" >&2
+    exit 1
+    ;;
+esac

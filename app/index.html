@@ -1,0 +1,125 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>VPN</title>
+<style>
+body { background: #111; color: #eee; font-family: sans-serif; text-align: center; padding-top: 25vh; visibility: hidden; }  /* shown by show() */
+/* background by state, set in show() */
+body.ok { background: #0e2a16; }
+body.wait { background: #2a2408; }
+body.bad { background: #2a0e0e; }
+#status { font-size: 64px; margin-bottom: 20px; }
+#profile { font-size: 40px; color: #aaa; margin-bottom: 60px; }
+/* up/down arrows (CSS triangles) when there is more than one profile */
+#profile.multi::before, #profile.multi::after { content: ''; display: block; width: 0; margin: 12px auto; border: 16px solid transparent; }
+#profile.multi::before { border-top-width: 0; border-bottom-color: #aaa; }
+#profile.multi::after { border-bottom-width: 0; border-top-color: #aaa; }
+button { font-size: 48px; width: 440px; padding: 20px 0; margin: 0 20px; border: 4px solid #555; background: #333; color: #eee; }
+button:focus { border-color: #fff; background: #555; outline: none; }
+</style>
+</head>
+<body>
+<div id="status"></div>
+<div id="profile"></div>
+<button id="btn" disabled></button>
+<button id="reconnect" disabled>Reconnect</button>
+<script>
+// ES5 only: the webOS 3.x web engine predates arrow functions, let/const and async.
+var VPN = '/media/developer/vpn/vpn';
+var bridges = {};   // keep bridges referenced until their reply arrives
+var seq = 0;
+var state = '';
+var profiles = [];
+var sel = 0;   // index into profiles
+var cur = '';  // active profile: "*" in vpn list, then the last one passed to up/restart
+var busy = false;  // an up/down/restart is in flight; status polls must not re-enable the buttons
+
+function exec(cmd, cb) {
+    var id = ++seq;
+    var b = new PalmServiceBridge();
+    bridges[id] = b;
+    var t = setTimeout(function () {
+        delete bridges[id];
+        try { b.cancel(); } catch (e) {}
+        cb('no response');
+    }, 5000);
+    b.onservicecallback = function (msg) {
+        clearTimeout(t);
+        delete bridges[id];
+        var r = JSON.parse(msg);
+        cb(r.returnValue ? r.stdoutString : 'error: ' + (r.errorText || msg));
+    };
+    b.call('luna://org.webosbrew.hbchannel.service/exec', JSON.stringify({ command: cmd }));
+}
+
+function show(s) {
+    document.body.style.visibility = 'visible';
+    state = s.replace(/\s+$/, '');
+    document.body.className = state === 'connected' ? 'ok'
+        : (state === 'connecting' || state === 'reconnecting') ? 'wait' : 'bad';
+    document.getElementById('status').textContent =
+        'VPN: ' + state + (state !== 'disconnected' && cur ? ' (' + cur + ')' : '');
+    var btn = document.getElementById('btn');
+    btn.textContent = state === 'disconnected' ? 'Connect' : 'Disconnect';
+    btn.disabled = busy;
+    document.getElementById('reconnect').disabled = busy;
+    showProfile();
+    if (document.activeElement === document.body) btn.focus();
+}
+
+function refresh() { exec(VPN + ' status', show); }
+
+function showProfile() {
+    var p = document.getElementById('profile');
+    p.textContent = profiles.length ? 'Profile: ' + profiles[sel] : 'no profiles';
+    p.className = profiles.length > 1 ? 'multi' : '';
+    document.getElementById('reconnect').textContent =
+        state !== 'disconnected' && profiles.length && profiles[sel] !== cur ? 'Switch' : 'Reconnect';
+}
+
+// "vpn list" prints one profile per line, the current one prefixed with "* "
+function loadProfiles(s) {
+    var lines = s.split('\n');
+    for (var i = 0; i < lines.length; i++) {
+        var m = /^([* ]) (.+)$/.exec(lines[i]);
+        if (!m) continue;
+        if (m[1] === '*') { sel = profiles.length; cur = m[2]; }
+        profiles.push(m[2]);
+    }
+    showProfile();
+}
+
+function act(arg) {
+    busy = true;
+    document.getElementById('btn').disabled = true;
+    document.getElementById('reconnect').disabled = true;
+    exec(VPN + ' ' + arg, function () { busy = false; refresh(); });
+}
+
+document.getElementById('btn').onclick = function () {
+    if (state !== 'disconnected') return act('down');
+    cur = profiles[sel] || '';
+    act('up ' + cur);
+};
+document.getElementById('reconnect').onclick = function () {
+    cur = profiles[sel] || '';
+    act('restart ' + cur);
+};
+
+document.onkeydown = function (e) {
+    if (e.keyCode === 37) document.getElementById('btn').focus();     // left
+    if (e.keyCode === 39) document.getElementById('reconnect').focus();   // right
+    // up/down: select profile; Connect/Reconnect use it
+    if ((e.keyCode === 38 || e.keyCode === 40) && profiles.length) {
+        sel = (sel + (e.keyCode === 40 ? 1 : profiles.length - 1)) % profiles.length;
+        showProfile();
+    }
+};
+
+// profiles first, then status, so the page is complete when it becomes visible
+exec(VPN + ' list', function (s) { loadProfiles(s); refresh(); });
+setInterval(refresh, 2000);
+</script>
+</body>
+</html>

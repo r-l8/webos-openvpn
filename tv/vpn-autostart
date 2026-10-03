@@ -1,0 +1,3 @@
+#!/bin/sh
+# Connect the VPN at boot. Copy to /var/lib/webosbrew/init.d for autostart
+exec /media/developer/vpn/vpn up
